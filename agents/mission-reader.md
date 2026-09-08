@@ -1,7 +1,7 @@
 ---
 name: mission-reader
 description: Mission research agent. Answers the orchestrator's questions about the codebase with compact, curated summaries and file:line references. Read-only — cannot write.
-model: "zai/glm-4.5-air"
+model: "omlx/Qwen3.6-35B-A3B-OptiQ-4bit"
 tools:
   - read
   - grep
