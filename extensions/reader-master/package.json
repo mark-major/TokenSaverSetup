@@ -1,0 +1,9 @@
+{
+  "name": "omp-reader-master",
+  "version": "2.1.0",
+  "description": "OMP extension: tool-mediated read-only reader agent that keeps the main session's token usage 2-3x below a plain session",
+  "license": "MIT",
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
