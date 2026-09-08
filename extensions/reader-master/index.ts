@@ -1,158 +1,130 @@
 /**
  * Reader-master extension for OMP.
  *
- * Deterministic bookkeeping only: persists state to
- * .reader-master/state.json, enforces progression gates, and exposes a
- * /reader-master command. All intelligence lives in the prompts. Two-role
- * model: the main session orchestrates AND implements; one persistent
- * mission-reader agent (read-only) handles codebase exploration so the main
- * session's token reads stay minimal.
+ * The main session asks research questions via the `ask_reader` tool; this
+ * extension owns everything else: it spawns a persistent headless reader
+ * process (`omp -p --continue` in a private session dir), enforces the RMAP
+ * reply protocol mechanically (parse + one schema re-ask on invalid JSON),
+ * and streams answers back per question as they land. Main never composes
+ * reader prompts or parses protocol by hand.
  */
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import {
-	applyAction,
-	emptyState,
-	MissionError,
-	type MissionAction,
-	type MissionState,
-} from "./state";
-
-const STATE_PATH = ".reader-master/state.json";
-
-const ORCHESTRATOR_BRIEF =
+export const ORCHESTRATOR_BRIEF =
 	`You are the orchestrator AND the implementer.\n\n` +
-	`## Planning (reader_update TOOL — call it directly; never write to the state file or xd:// docs)\n` +
-	`reader_update takes {"actions":[...]} — batch SEVERAL state actions per call whenever gates allow: set_contract + add_feature + start_executing in ONE call; complete_feature + complete_mission in ONE call.\n` +
-	`2. set_contract: assertions (id, text) that together define "done" — observable behavior, not code shape.\n` +
-`3. add_feature per feature; each covers >=1 assertion id. Decompose to the FEWEST features that cover the contract — a small task is exactly ONE feature. Each extra feature is a full serial implementation cycle.\n` +
-	`4. start_executing after the user approves the plan (skip approval only if they pre-approved).\n\n` +
-`## Research — route through your reader (RMAP protocol)\n` +
-`Spawn exactly ONE mission-reader agent via the task tool (persistent; reuse it for the whole run by messaging its agent id via hub).\n` +
-`REQUEST format: {"qs":["question 1","question 2"]} — batch ALL questions in one message; at most TWO reader messages per feature.\n` +
-`REPLY format (mandatory): {"map":[{"id":"qs[0]","a":"answer","refs":[{"f":"path","l":[start,end],"d":"what it is","read":true}]}],"gaps":["..."]}. Consume it: ` +
-`refs with "read":true are exactly what you open with offset/limit — never whole files. Refs are your only navigation; if a reply is not valid RMAP JSON, re-ask once citing the schema, then fall back to a range read around the cited file. NEVER grep/read/glob yourself except ranged reads of reader-cited files ` +
-`and the immediate context of code you are editing. Your context is the scarce resource; the reader's is not.\n\n` +
-	`## Execution (per feature, serially)\n` +
-`2. Ask the reader anything you need, then implement YOURSELF (edit/write/bash). Keep diffs minimal.\n` +
-`   The reader's answers cite file:line refs — use them: read each cited range with offset/limit (ref line ±40), NEVER whole files. Whole-file reads at your token prices are the expense this pipeline exists to avoid; go whole-file only when a range read proves insufficient or the file is smaller than a screen.\n` +
-`   Bash is for BUILDING AND TESTING ONLY (run tests, typecheck, git commit). NEVER use bash for exploration — no ls, grep, find, cat, head — that is the reader's job.\n` +
-	`3. Verify: build/tests/lint pass and the feature's assertions plausibly hold.\n` +
-`4. complete_feature {id, summary} — tight summary: what changed, commands + exit codes, anything left undone.\n` +
-`If a feature is not completable, fail_feature {id, issue} — this blocks until you resolve_issue.\n` +
-`When the last feature is done, issue complete_feature + complete_mission in the SAME turn.`;
+	`## Work\n` +
+	`Read the goal/spec. Identify its units of work; implement them SERIALLY — implement, verify (build/tests), git commit with a clear message, then move to the next unit. Keep diffs minimal. Finish when every unit is committed and all tests pass.\n\n` +
+	`## Research\n` +
+	`Route ALL codebase research through the ask_reader tool: {"qs":[...]} — batch your questions, one call per unit of work. Its answers cite verified file:line refs; open each read:true ref with offset/limit (ref line ±40), NEVER whole files. NEVER grep/glob/read for exploration yourself except ranged reads of reader-cited files and the immediate context of code you are editing. Your context is the scarce resource; the reader's is not.\n` +
+	`Bash is for BUILDING AND TESTING ONLY (run tests, typecheck, git commit). NEVER use bash for exploration — no ls, grep, find, cat, head.`;
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-async function readState(cwd: string): Promise<MissionState | null> {
-	const file = Bun.file(`${cwd}/${STATE_PATH}`);
-	if (!(await file.exists())) return null;
-	return (await file.json()) as MissionState;
-}
+const READER_MODEL = process.env.RMASTER_READER_MODEL ?? "zai/glm-4.5-air";
+const READER_TOOLS = "read,grep,glob,lsp,ast_grep";
 
-async function writeState(cwd: string, state: MissionState): Promise<void> {
-	await Bun.write(`${cwd}/${STATE_PATH}`, JSON.stringify(state, null, 2) + "\n");
-}
-
-function renderStatus(s: MissionState): string {
-	const lines: string[] = [];
-	lines.push(`Run: ${s.goal}`);
-	lines.push(`Status: ${s.status}`);
-	if (s.status === "planning") lines.push("(planning — define contract + features, then start_executing)");
-	for (const f of s.features) {
-		lines.push(`  ${f.status.padEnd(12)} ${f.id}  ${f.title}`);
-	}
-	if (!s.features.length) lines.push("\nNo features planned yet.");
-	const open = s.issues.filter((i) => i.open);
-	if (open.length) {
-		lines.push(`\nOpen issues (${open.length}):`);
-		for (const i of open) lines.push(`  ${i.id}: ${i.description}`);
-	}
-	const coverage = s.contract.map((a) => `${a.id}: ${a.text} <- [${a.coveredBy.join(", ") || "UNCOVERED"}]`);
-	if (coverage.length) lines.push(`\nValidation contract:\n  ${coverage.join("\n  ")}`);
-	return lines.join("\n");
-}
+const READER_RULES =
+	`You are a read-only codebase research agent. Answer the orchestrator's questions.\n` +
+	`Your ENTIRE final output must be ONE JSON object, no prose outside it:\n` +
+	`{"map":[{"id":"qs[0]","a":"<=12 word answer","refs":[{"f":"path","l":[start,end],"d":"<=12 words","read":true}]}],"gaps":["..."]}\n` +
+	`Schema: "a" = answer in at most 12 words. "refs" = array of {"f": repo-relative path, "l": [start,end] line range you VERIFIED with a read/grep call in this session, "d": what the range is in <=12 words, "read": true only for ranges the orchestrator must open before editing (edit site + ~10 context lines, max 6 per reply)}. "gaps" = one line per unverifiable point.\n` +
+	`Rules: every claim needs a verified ref; no verified range = put it in gaps, do not guess. id echoes the question ("qs[0]"). JSON only, no markdown fences, no text before or after. You are read-only: refuse write requests in gaps.`;
 
 export default function readerMasterExtension(pi: ExtensionAPI) {
-	const z = pi.zod;
-
 	pi.setLabel("Reader Master");
 
+	// Reader session state (per run).
+	let sessionDir: string | null = null;
+
+	async function runReader(question: string, cont: boolean, cwd: string, signal?: AbortSignal) {
+		const args = [
+			"-p", "--mode", "json", "--no-title", "--no-extensions",
+			"--model", READER_MODEL, "--tools", READER_TOOLS,
+			"--approval-mode", "yolo", "--max-time", "300",
+			"--append-system-prompt", READER_RULES,
+			"--session-dir", sessionDir!,
+		];
+		if (cont) args.push("--continue");
+		args.push(question);
+		const res = await pi.exec("omp", args, { signal, cwd });
+		if (res.killed) throw new Error("reader cancelled");
+		if (res.code !== 0) throw new Error(`reader failed: ${(res.stderr || "").slice(-300)}`);
+		// Pull the final assistant text out of the json event stream.
+		let text = "";
+		for (const line of res.stdout.split("\n")) {
+			if (!line.startsWith("{")) continue;
+			try {
+				const ev = JSON.parse(line);
+				const msg = ev?.message ?? ev;
+				if ((ev.type === "message_end" || ev.type === "message_update") && msg?.role === "assistant") {
+					for (const b of msg.content ?? []) {
+						if (b.type === "text" && b.text) text = b.text;
+					}
+				}
+			} catch {}
+		}
+		return text.trim();
+	}
+
+	pi.registerTool({
+		name: "ask_reader",
+		label: "Ask Reader",
+		description:
+			"Ask your read-only research agent questions about the codebase. Pass all questions at once: {\"qs\":[\"...\",\"...\"]}. " +
+			"Answers arrive as verified RMAP refs {f: path, l: [start,end], read} — open each read:true ref with offset/limit (±40 lines), never whole files. " +
+			"NEVER grep/glob/read for exploration yourself; all research routes through this tool. Batch questions; one call per unit of work.",
+		parameters: pi.zod.object({
+			qs: pi.zod.array(pi.zod.string()).min(1).describe("Research questions, plain text"),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx) {
+			if (!sessionDir) {
+				sessionDir = `${process.env.HOME}/.omp/reader-sessions/${Date.now().toString(36)}`;
+				await pi.exec("mkdir", ["-p", sessionDir], {});
+			}
+			const maps: unknown[] = [];
+			const gaps: string[] = [];
+			for (let i = 0; i < params.qs.length; i++) {
+				const q = JSON.stringify({ qs: [params.qs[i]] });
+				let reply = await runReader(q, maps.length > 0, ctx.cwd, signal);
+				let parsed: any = null;
+				try {
+					parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim());
+				} catch {}
+				if (!parsed || !Array.isArray(parsed.map)) {
+					// One mechanical schema re-ask, then fall back to raw text.
+					reply = await runReader(q + "\nYour previous reply was not valid RMAP JSON. Reply with ONLY the JSON object per the schema.", true, ctx.cwd, signal);
+					try { parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim()); } catch {}
+				}
+				if (parsed && Array.isArray(parsed.map)) {
+					for (const m of parsed.map) maps.push(m);
+					for (const g of parsed.gaps ?? []) gaps.push(String(g));
+				} else {
+					maps.push({ id: `qs[${i}]`, a: reply.slice(0, 400), refs: [] });
+					gaps.push(`qs[${i}]: reader did not produce valid RMAP JSON`);
+				}
+				// Stream progress: answers land one question at a time.
+				onUpdate?.({
+					content: [{ type: "text", text: `reader answered ${i + 1}/${params.qs.length}` }],
+					details: { answered: i + 1, of: params.qs.length, last: maps[maps.length - 1] },
+				});
+			}
+			const payload = JSON.stringify({ map: maps, gaps });
+			return {
+				content: [{ type: "text", text: payload }],
+				details: { answers: maps.length, gaps: gaps.length },
+			};
+		},
+	});
+
 	pi.registerCommand("reader-master", {
-		description: "Start or inspect a reader-master run (orchestrator session + read-only reader agent)",
+		description: "Brief this session as a reader-master run (ask_reader tool handles all research)",
 		handler: async (args, ctx) => {
-			const existing = await readState(ctx.cwd);
 			const goal = args?.trim();
 			if (!goal) {
-				if (!existing) {
-					ctx.ui.notify("No active run. Usage: /reader-master <goal>", "info");
-					return;
-				}
-				ctx.ui.notify(renderStatus(existing), "info");
+				ctx.ui.notify("Usage: /reader-master <goal>", "info");
 				return;
 			}
-			if (existing && existing.status !== "done") {
-				ctx.ui.notify(
-					`Run already active (${existing.status}): ${existing.goal}. Finish it or delete ${STATE_PATH} to start over.`,
-					"warning",
-				);
-				return;
-			}
-			const state = emptyState(goal);
-			await writeState(ctx.cwd, state);
-			// The session itself is the orchestrator — brief it directly.
 			pi.sendUserMessage(`Start a run. Goal: ${goal}\n\n${ORCHESTRATOR_BRIEF}`, {
 				deliverAs: "nextTurn",
 				triggerTurn: true,
 			});
-			ctx.ui.notify(`Run created: ${STATE_PATH}`, "info");
 		},
 	});
-
-	pi.registerTool({
-		name: "reader_update",
-		label: "Reader Update",
-		description:
-			"Record progress on the active run (.reader-master/state.json). Call the tool DIRECTLY — never edit the state file. " +
-			'Payload: {"actions":[...]} — batch SEVERAL actions in one call whenever gates allow (e.g. set_contract + add_feature + start_executing together; complete_feature + complete_mission together). Single-action examples: {"action":"set_contract","assertions":[{"id":"A1","text":"..."}]} | {"action":"add_feature","id":"F1","title":"...","assertions":["A1"]} | {"action":"start_feature","id":"F1"} | {"action":"complete_feature","id":"F1","summary":"..."} | {"action":"fail_feature","id":"F1","issue":"..."} | {"action":"resolve_issue","id":"issue-1"} | {"action":"start_executing"} | {"action":"complete_mission"}. ' +
-			"Gates block invalid transitions - read the error and comply.",
-		parameters: z.object({
-			actions: z
-				.array(
-					z.object({
-						action: z.enum([
-							"set_contract", "add_feature", "start_feature", "complete_feature",
-							"fail_feature", "resolve_issue", "start_executing", "complete_mission",
-						]),
-						assertions: z.array(z.union([z.string(), z.object({ id: z.string(), text: z.string() })])).optional(),
-						id: z.string().optional(),
-						title: z.string().optional(),
-						summary: z.string().optional(),
-						issue: z.string().optional(),
-						goal: z.string().optional(),
-					}),
-				)
-				.optional(),
-		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const state = await readState(ctx.cwd);
-			if (!state) return { content: [{ type: "text", text: `No active run (${STATE_PATH} missing). Run /reader-master <goal>.` }] };
-			// add_feature takes bare assertion ids; normalize object forms to their ids.
-			const norm = (p: (typeof params.actions)[number]): (typeof params.actions)[number] =>
-				p.action === "add_feature" && Array.isArray(p.assertions)
-					? { ...p, assertions: p.assertions.map((a) => (typeof a === "string" ? a : a.id)) }
-					: p;
-			const list = params.actions?.length ? params.actions : [];
-			if (!list.length) return { content: [{ type: "text", text: "BLOCKED: pass actions:[...]" }] };
-			try {
-				let next = state;
-				for (const p of list) {
-					next = applyAction(next, norm(p) as MissionAction);
-				}
-				await writeState(ctx.cwd, next);
-				return { content: [{ type: "text", text: `OK (${list.length} action${list.length === 1 ? "" : "s"} applied; status: ${next.status})` }], details: { status: next.status } };
-			} catch (err) {
-				const msg = err instanceof MissionError ? err.message : String(err);
-				return { content: [{ type: "text", text: `BLOCKED: ${msg}` }] };
-			}
-		},
-	});
-
 }
