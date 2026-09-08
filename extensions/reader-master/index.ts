@@ -32,6 +32,7 @@ export default function readerMasterExtension(pi: ExtensionAPI) {
 
 	// Reader session state (per run).
 	let sessionDir: string | null = null;
+	let readerStarted = false;
 
 	async function runReader(question: string, cont: boolean, cwd: string, signal?: AbortSignal) {
 		const args = [
@@ -78,32 +79,27 @@ export default function readerMasterExtension(pi: ExtensionAPI) {
 				sessionDir = `${process.env.HOME}/.omp/reader-sessions/${Date.now().toString(36)}`;
 				await pi.exec("mkdir", ["-p", sessionDir], {});
 			}
-			const maps: unknown[] = [];
-			const gaps: string[] = [];
-			for (let i = 0; i < params.qs.length; i++) {
-				const q = JSON.stringify({ qs: [params.qs[i]] });
-				let reply = await runReader(q, maps.length > 0, ctx.cwd, signal);
-				let parsed: any = null;
-				try {
-					parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim());
-				} catch {}
-				if (!parsed || !Array.isArray(parsed.map)) {
-					// One mechanical schema re-ask, then fall back to raw text.
-					reply = await runReader(q + "\nYour previous reply was not valid RMAP JSON. Reply with ONLY the JSON object per the schema.", true, ctx.cwd, signal);
-					try { parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim()); } catch {}
-				}
-				if (parsed && Array.isArray(parsed.map)) {
-					for (const m of parsed.map) maps.push(m);
-					for (const g of parsed.gaps ?? []) gaps.push(String(g));
-				} else {
-					maps.push({ id: `qs[${i}]`, a: reply.slice(0, 400), refs: [] });
-					gaps.push(`qs[${i}]: reader did not produce valid RMAP JSON`);
-				}
-				// Stream progress: answers land one question at a time.
-				onUpdate?.({
-					content: [{ type: "text", text: `reader answered ${i + 1}/${params.qs.length}` }],
-					details: { answered: i + 1, of: params.qs.length, last: maps[maps.length - 1] },
-				});
+			const q = JSON.stringify({ qs: params.qs });
+			onUpdate?.({ content: [{ type: "text", text: `reader researching ${params.qs.length} question(s)...` }] });
+			let reply = await runReader(q, readerStarted, ctx.cwd, signal);
+			readerStarted = true;
+			let parsed: any = null;
+			try {
+				parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim());
+			} catch {}
+			if (!parsed || !Array.isArray(parsed.map)) {
+				// One mechanical schema re-ask, then fall back to raw text.
+				reply = await runReader(q + "\nYour previous reply was not valid RMAP JSON. Reply with ONLY the JSON object per the schema.", true, ctx.cwd, signal);
+				try { parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim()); } catch {}
+			}
+			let maps: unknown[] = [];
+			let gaps: string[] = [];
+			if (parsed && Array.isArray(parsed.map)) {
+				maps = parsed.map;
+				gaps = (parsed.gaps ?? []).map(String);
+			} else {
+				maps = params.qs.map((_x, i) => ({ id: `qs[${i}]`, a: reply.slice(0, 400), refs: [] }));
+				gaps = ["reader did not produce valid RMAP JSON"];
 			}
 			const payload = JSON.stringify({ map: maps, gaps });
 			return {
