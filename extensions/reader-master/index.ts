@@ -2,8 +2,8 @@
  * Reader-master extension for OMP.
  *
  * The main session asks research questions via the `ask_reader` tool; this
- * extension owns everything else: it spawns a persistent headless reader
- * process (`omp -p --continue` in a private session dir), enforces the RMAP
+ * extension owns everything else: it spawns a stateless reader process
+ * (`omp -p` in a private session dir), enforces the RMAP
  * reply protocol mechanically (parse + one schema re-ask on invalid JSON),
  * and streams answers back per question as they land. Main never composes
  * reader prompts or parses protocol by hand.
@@ -17,7 +17,7 @@ export const ORCHESTRATOR_BRIEF =
 	`Bash is for BUILDING AND TESTING ONLY (run tests, typecheck, git commit). NEVER use bash for exploration — no ls, grep, find, cat, head.`;
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const READER_MODEL = process.env.RMASTER_READER_MODEL ?? "zai/glm-4.5-air";
+const READER_MODEL = process.env.RMASTER_READER_MODEL ?? "omlx/qwen3.6-35b-a3b-oq4";
 const READER_TOOLS = "read,grep,glob,lsp,ast_grep";
 
 const READER_RULES =
@@ -30,19 +30,16 @@ const READER_RULES =
 export default function readerMasterExtension(pi: ExtensionAPI) {
 	pi.setLabel("Reader Master");
 
-	// Reader session state (per run).
-	let sessionDir: string | null = null;
-	let readerStarted = false;
-
-	async function runReader(question: string, cont: boolean, cwd: string, signal?: AbortSignal) {
+	// No persistent session — each ask_reader call is independent and stateless.
+	async function runReader(question: string, cwd: string, signal?: AbortSignal, sessionDir?: string) {
 		const args = [
 			"-p", "--mode", "json", "--no-title", "--no-extensions",
 			"--model", READER_MODEL, "--tools", READER_TOOLS,
 			"--approval-mode", "yolo", "--max-time", "300",
 			"--append-system-prompt", READER_RULES,
-			"--session-dir", sessionDir!,
+			"--session-dir", sessionDir ?? "",
 		];
-		if (cont) args.push("--continue");
+		// No --continue: each call is a fresh, independent run.
 		args.push(question);
 		const res = await pi.exec("omp", args, { signal, cwd });
 		if (res.killed) throw new Error("reader cancelled");
@@ -75,21 +72,18 @@ export default function readerMasterExtension(pi: ExtensionAPI) {
 			qs: pi.zod.array(pi.zod.string()).min(1).describe("Research questions, plain text"),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
-			if (!sessionDir) {
-				sessionDir = `${process.env.HOME}/.omp/reader-sessions/${Date.now().toString(36)}`;
-				await pi.exec("mkdir", ["-p", sessionDir], {});
-			}
 			const q = JSON.stringify({ qs: params.qs });
 			onUpdate?.({ content: [{ type: "text", text: `reader researching ${params.qs.length} question(s)...` }] });
-			let reply = await runReader(q, readerStarted, ctx.cwd, signal);
-			readerStarted = true;
-			let parsed: any = null;
+			const tmpDir = `${process.env.HOME}/.omp/reader-sessions/${Date.now().toString(36)}`;
+			await pi.exec("mkdir", ["-p", tmpDir], {});
+			let reply = await runReader(q, ctx.cwd, signal, tmpDir);
+			let parsed: unknown = null;
 			try {
 				parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim());
 			} catch {}
 			if (!parsed || !Array.isArray(parsed.map)) {
 				// One mechanical schema re-ask, then fall back to raw text.
-				reply = await runReader(q + "\nYour previous reply was not valid RMAP JSON. Reply with ONLY the JSON object per the schema.", true, ctx.cwd, signal);
+				reply = await runReader(q + "\nYour previous reply was not valid RMAP JSON. Reply with ONLY the JSON object per the schema.", ctx.cwd, signal, tmpDir);
 				try { parsed = JSON.parse(reply.replace(/^```(?:json)?|```$/g, "").trim()); } catch {}
 			}
 			let maps: unknown[] = [];
